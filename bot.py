@@ -8,6 +8,8 @@ import json
 import re
 import tempfile
 import httpx
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,12 +18,14 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+REMINDER_SECRET = os.environ.get("REMINDER_SECRET", "geheim123")
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 state = {
     "responded_today": False,
     "leave_until": None,
+    "app": None,
 }
 
 def is_on_leave():
@@ -42,10 +46,7 @@ def write_to_sheet(entries, transcript):
             "beschrijving": entry.get("beschrijving", ""),
             "transcript": transcript
         })
-    payload = {"rows": rows}
-    logger.info(f"Sending to webhook: {rows}")
-    r = httpx.post(WEBHOOK_URL, json=payload, follow_redirects=True, timeout=30)
-    logger.info(f"Webhook response: {r.status_code} {r.text[:200]}")
+    r = httpx.post(WEBHOOK_URL, json={"rows": rows}, follow_redirects=True, timeout=30)
     if r.status_code != 200 or r.text.strip() != "OK":
         raise Exception(f"Webhook fout: {r.status_code} {r.text[:100]}")
 
@@ -117,7 +118,6 @@ async def process_message(update, transcript):
         uren = e['minuten'] / 60
         confirm_text += f"• *{e['klant']}* ({e['datum']}) — {e['beschrijving']} ({e['minuten']} min / {uren:.1f}u)\n"
     await update.message.reply_text(confirm_text, parse_mode="Markdown")
-
     write_to_sheet(entries, transcript)
     state["responded_today"] = True
     await update.message.reply_text("🎉 Staat in je sheet!")
@@ -155,33 +155,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Oeps: {str(e)}")
 
-async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
-    reset_daily_state()
-    if is_on_leave():
-        return
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊", parse_mode="Markdown")
+# --- HTTP server voor cron-job.org triggers ---
+class ReminderHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        import asyncio
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        secret = params.get("secret", [""])[0]
+        trigger = parsed.path.strip("/")
 
-async def send_followup_reminder(context: ContextTypes.DEFAULT_TYPE):
-    if state["responded_today"] or is_on_leave():
-        return
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊", parse_mode="Markdown")
+        if secret != REMINDER_SECRET:
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden")
+            return
 
-async def send_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    if is_on_leave():
-        return
-    yesterday = date.today() - timedelta(days=1)
-    if yesterday.weekday() >= 5:
-        return
-    if not state["responded_today"]:
-        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤")
+        app = state.get("app")
+        if not app:
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b"Bot not ready")
+            return
+
+        async def send_reminder():
+            if trigger == "reminder17":
+                reset_daily_state()
+                if not is_on_leave():
+                    await app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊",
+                        parse_mode="Markdown"
+                    )
+            elif trigger == "reminder1730":
+                if not state["responded_today"] and not is_on_leave():
+                    await app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊",
+                        parse_mode="Markdown"
+                    )
+            elif trigger == "reminder09":
+                if not is_on_leave():
+                    yesterday = date.today() - timedelta(days=1)
+                    if yesterday.weekday() < 5 and not state["responded_today"]:
+                        await app.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤"
+                        )
+
+        asyncio.run_coroutine_threadsafe(send_reminder(), app.update_queue._loop if hasattr(app.update_queue, '_loop') else asyncio.get_event_loop())
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        logger.info(f"HTTP: {format % args}")
+
+def start_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), ReminderHandler)
+    logger.info(f"HTTP server op poort {port}")
+    server.serve_forever()
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    state["app"] = app
+
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
-    app.job_queue.run_daily(send_daily_reminder, time=datetime.strptime("16:00", "%H:%M").time(), days=(0,1,2,3,4))
-    app.job_queue.run_daily(send_followup_reminder, time=datetime.strptime("16:30", "%H:%M").time(), days=(0,1,2,3,4))
-    app.job_queue.run_daily(send_morning_reminder, time=datetime.strptime("08:00", "%H:%M").time(), days=(0,1,2,3,4))
+
+    # Start HTTP server in aparte thread
+    t = threading.Thread(target=start_http_server, daemon=True)
+    t.start()
+
     logger.info("🤖 Bot gestart!")
     app.run_polling()
 
