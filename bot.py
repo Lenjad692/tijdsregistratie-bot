@@ -4,11 +4,12 @@ from datetime import datetime, date, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import openai
-import gspread
-from google.oauth2.service_account import Credentials
 import json
 import re
 import tempfile
+import httpx
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,9 +18,6 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-
-# Individuele Google credentials velden
-GOOGLE_TYPE = os.environ.get("GOOGLE_TYPE", "service_account")
 GOOGLE_PROJECT_ID = os.environ["GOOGLE_PROJECT_ID"]
 GOOGLE_PRIVATE_KEY_ID = os.environ["GOOGLE_PRIVATE_KEY_ID"]
 GOOGLE_PRIVATE_KEY = os.environ["GOOGLE_PRIVATE_KEY"].replace('\\n', '\n')
@@ -41,9 +39,9 @@ def is_on_leave():
 def reset_daily_state():
     state["responded_today"] = False
 
-def get_sheet():
+def get_credentials():
     creds_dict = {
-        "type": GOOGLE_TYPE,
+        "type": "service_account",
         "project_id": GOOGLE_PROJECT_ID,
         "private_key_id": GOOGLE_PRIVATE_KEY_ID,
         "private_key": GOOGLE_PRIVATE_KEY,
@@ -52,29 +50,32 @@ def get_sheet():
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
     }
-    logger.info(f"Connecting as: {GOOGLE_CLIENT_EMAIL}")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    creds.refresh(Request())
+    return creds.token
 
 def write_to_sheet(entries, date_str, transcript):
-    sheet = get_sheet()
+    token = get_credentials()
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/A1:append"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
     for entry in entries:
-        row = [
-            date_str,
-            entry.get("klant", ""),
-            entry.get("minuten", 0),
-            entry.get("beschrijving", ""),
-            transcript
-        ]
-        sheet.append_row(row)
+        row = [date_str, entry.get("klant", ""), entry.get("minuten", 0), entry.get("beschrijving", ""), transcript]
+        params = {"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}
+        body = {"values": [row]}
+        logger.info(f"Writing to sheet: {row[:3]}")
+        r = httpx.post(url, headers=headers, params=params, json=body)
+        logger.info(f"Sheet response: {r.status_code} {r.text[:200]}")
+        r.raise_for_status()
 
 async def transcribe_voice(file_path):
     with open(file_path, "rb") as f:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1", file=f, language="nl"
-        )
+        transcript = client.audio.transcriptions.create(model="whisper-1", file=f, language="nl")
     return transcript.text
 
 async def parse_timeentry(transcript):
@@ -96,11 +97,7 @@ Extraheer ALLE tijdsvermeldingen:
 Antwoord ALLEEN met JSON array, geen uitleg, geen backticks:
 [{{"datum": "6-3-2026", "klant": "...", "beschrijving": "...", "minuten": 60}}]
 """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
@@ -118,11 +115,7 @@ Antwoord ALLEEN met JSON, geen uitleg, geen backticks:
 - Verlof periode: {{"is_leave": true, "until": "D-M-YYYY"}}
 - Geen verlof: {{"is_leave": false, "until": null}}
 """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
@@ -136,9 +129,7 @@ async def process_message(update, transcript):
             until_date = datetime.strptime(until_str, "%d-%m-%Y").date()
             state["leave_until"] = until_date
             state["responded_today"] = True
-            await update.message.reply_text(
-                f"🏖️ Begrepen! Geen herinneringen tot en met {until_date.strftime('%-d/%-m')}. Geniet! 😊"
-            )
+            await update.message.reply_text(f"🏖️ Begrepen! Geen herinneringen tot en met {until_date.strftime('%-d/%-m')}. Geniet! 😊")
         except Exception:
             state["responded_today"] = True
             await update.message.reply_text("🏖️ Begrepen, geen registratie vandaag!")
@@ -151,9 +142,7 @@ async def process_message(update, transcript):
         confirm_text += f"• *{e['klant']}* ({e['datum']}) — {e['beschrijving']} ({e['minuten']} min / {uren:.1f}u)\n"
     await update.message.reply_text(confirm_text, parse_mode="Markdown")
 
-    for entry in entries:
-        write_to_sheet([entry], entry['datum'], transcript)
-
+    write_to_sheet(entries, entries[0]['datum'] if entries else date.today().strftime("%-d-%-m-%Y"), transcript)
     state["responded_today"] = True
     await update.message.reply_text("🎉 Staat in je sheet!")
 
@@ -171,7 +160,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📝 Ik hoorde:\n_{transcript}_", parse_mode="Markdown")
         await process_message(update, transcript)
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Oeps: {str(e)}\n\nProbeer opnieuw!")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,14 +169,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text.startswith("/start"):
         await update.message.reply_text(
-            "👋 Hallo Lenja! Ik ben je tijdsregistratie-bot.\n\n"
-            "Elke weekdag om 17:00 stuur ik je een herinnering.\n"
-            "Stuur een 🎤 voice bericht — meerdere klanten mag in één bericht!\n\n"
-            "*Handige commando's:*\n"
-            "• _'vandaag verlof'_ → geen herinnering vandaag\n"
-            "• _'ik ben volgende week in verlof'_ → geen herinneringen die week\n"
-            "• _'gisteren werkte ik voor...'_ → voegt toe met gisteren als datum\n\n"
-            "Je kan ook gewoon tekst sturen als alternatief voor voice! 😊",
+            "👋 Hallo Lenja! Ik ben je tijdsregistratie-bot.\n\nElke weekdag om 17:00 stuur ik je een herinnering.\nStuur een 🎤 voice bericht — meerdere klanten mag in één bericht!\n\n*Handige commando's:*\n• _'vandaag verlof'_ → geen herinnering vandaag\n• _'ik ben volgende week in verlof'_ → geen herinneringen die week\n• _'gisteren werkte ik voor...'_ → voegt toe met gisteren als datum",
             parse_mode="Markdown"
         )
         return
@@ -201,20 +183,12 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     reset_daily_state()
     if is_on_leave():
         return
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊",
-        parse_mode="Markdown"
-    )
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊", parse_mode="Markdown")
 
 async def send_followup_reminder(context: ContextTypes.DEFAULT_TYPE):
     if state["responded_today"] or is_on_leave():
         return
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊",
-        parse_mode="Markdown"
-    )
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊", parse_mode="Markdown")
 
 async def send_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     if is_on_leave():
@@ -223,10 +197,7 @@ async def send_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     if yesterday.weekday() >= 5:
         return
     if not state["responded_today"]:
-        await context.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤"
-        )
+        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
