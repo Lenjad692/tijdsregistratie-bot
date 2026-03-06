@@ -205,7 +205,11 @@ class ReminderHandler(BaseHTTPRequestHandler):
             elif trigger == "weekrapport":
                 await send_weekly_analysis(app, TELEGRAM_CHAT_ID)
 
-        asyncio.run_coroutine_threadsafe(send_reminder(), app.update_queue._loop if hasattr(app.update_queue, '_loop') else asyncio.get_event_loop())
+        future = asyncio.run_coroutine_threadsafe(send_reminder(), app._loop)
+        try:
+            future.result(timeout=30)
+        except Exception as ex:
+            logger.error(f"Reminder fout: {ex}")
 
         self.send_response(200)
         self.end_headers()
@@ -230,6 +234,11 @@ def main():
     # Start HTTP server in aparte thread
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
+
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app._loop = loop
 
     logger.info("🤖 Bot gestart!")
     app.run_polling()
