@@ -202,6 +202,8 @@ class ReminderHandler(BaseHTTPRequestHandler):
                             chat_id=TELEGRAM_CHAT_ID,
                             text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤"
                         )
+            elif trigger == "weekrapport":
+                await send_weekly_analysis(app, TELEGRAM_CHAT_ID)
 
         asyncio.run_coroutine_threadsafe(send_reminder(), app.update_queue._loop if hasattr(app.update_queue, '_loop') else asyncio.get_event_loop())
 
@@ -234,3 +236,76 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- Vrijdag analyse ---
+async def send_weekly_analysis(app, chat_id):
+    try:
+        # Haal data op uit sheet via Apps Script
+        r = httpx.get(
+            WEBHOOK_URL.replace("/exec", "/exec"),
+            params={"type": "stats", "secret": REMINDER_SECRET},
+            follow_redirects=True,
+            timeout=30
+        )
+        stats = r.json()
+        
+        total_hours = stats["totalHours"]
+        total_euro = stats["totalEuro"]
+        week_nr = stats["weekNr"]
+        per_klant = stats["perKlant"]
+        
+        doel_uren = 80
+        doel_euro = 8000
+        resterend_uren = max(0, doel_uren - total_hours)
+        weken_over = 4 - week_nr
+        uren_per_week_nodig = round(resterend_uren / max(weken_over, 1), 1) if weken_over > 0 else 0
+        
+        # Per klant overzicht
+        klant_tekst = ""
+        for klant, minuten in sorted(per_klant.items(), key=lambda x: x[1], reverse=True):
+            uren = round(minuten / 60, 1)
+            klant_tekst += f"  • {klant}: {uren}u\n"
+        
+        # Motivatie bericht
+        if total_hours > doel_uren:
+            motivatie = (
+                f"🌟 *Wauw, je hebt al {total_hours}u geregistreerd — dat is meer dan je doel van {doel_uren}u!*\n\n"
+                f"Ben je zeker dat je alles geregistreerd hebt? 🤔\n"
+                f"Wil je nog iets toevoegen, of neem je de extra uren mee naar volgende maand?"
+            )
+        elif total_hours >= doel_uren * 0.75:
+            motivatie = (
+                f"💪 *Goed bezig! Je zit op {total_hours}u van je {doel_uren}u doel.*\n\n"
+                f"Nog {resterend_uren}u te gaan. Als je nog {weken_over} week(en) hebt, "
+                f"moet je ~{uren_per_week_nodig}u/week halen. Dat lukt! 🚀"
+            )
+        elif total_hours >= doel_uren * 0.5:
+            motivatie = (
+                f"📈 *Halverwege! Je staat op {total_hours}u van je {doel_uren}u doel.*\n\n"
+                f"Nog {resterend_uren}u nodig in {weken_over} week(en) = ~{uren_per_week_nodig}u/week. "
+                f"Zet er een tandje bij! 💼"
+            )
+        else:
+            motivatie = (
+                f"⚡ *{total_hours}u geregistreerd — tijd om bij te steken!*\n\n"
+                f"Je doel is {doel_uren}u/maand. Nog {resterend_uren}u te gaan in {weken_over} week(en) "
+                f"= ~{uren_per_week_nodig}u/week. Je kan het! 💪"
+            )
+        
+        # Basis bericht
+        msg = (
+            f"📊 *Weekupdate — week {week_nr} van de maand*\n\n"
+            f"⏱ *Uren deze maand:* {total_hours}u / {doel_uren}u doel\n"
+        )
+        
+        # Vanaf week 2: ook euro's tonen
+        if week_nr >= 2:
+            msg += f"💶 *Te factureren:* €{total_euro} / €{doel_euro} doel\n"
+        
+        msg += f"\n*Per klant:*\n{klant_tekst}\n{motivatie}"
+        
+        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Weekrapport fout: {e}", exc_info=True)
+        await app.bot.send_message(chat_id=chat_id, text=f"❌ Kon weekrapport niet ophalen: {str(e)}")
