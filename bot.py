@@ -1,15 +1,16 @@
 import os
 import logging
-from datetime import datetime, date, timedelta
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import openai
+import threading
+import asyncio
 import json
 import re
 import tempfile
-import httpx
+from datetime import datetime, date, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+import openai
+import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ state = {
     "responded_today": False,
     "leave_until": None,
     "app": None,
+    "loop": None,
 }
 
 def is_on_leave():
@@ -52,8 +54,8 @@ def write_to_sheet(entries, transcript):
 
 async def transcribe_voice(file_path):
     with open(file_path, "rb") as f:
-        transcript = client.audio.transcriptions.create(model="whisper-1", file=f, language="nl")
-    return transcript.text
+        t = client.audio.transcriptions.create(model="whisper-1", file=f, language="nl")
+    return t.text
 
 async def parse_timeentry(transcript):
     today = date.today()
@@ -61,22 +63,18 @@ async def parse_timeentry(transcript):
     prompt = f"""
 Je bent een assistent die tijdsregistraties verwerkt. De gebruiker zei:
 "{transcript}"
-
 Vandaag: {today.strftime("%-d-%-m-%Y")} ({today.strftime("%A")})
 Gisteren: {yesterday.strftime("%-d-%-m-%Y")}
-
 Extraheer ALLE tijdsvermeldingen:
 - datum: "D-M-YYYY"
 - klant: naam
 - beschrijving: kort
 - minuten: getal (uren x 60)
-
 Antwoord ALLEEN met JSON array, geen uitleg, geen backticks:
 [{{"datum": "6-3-2026", "klant": "...", "beschrijving": "...", "minuten": 60}}]
 """
-    response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw).strip()
+    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
+    raw = re.sub(r"^```(?:json)?", "", r.choices[0].message.content.strip()).strip()
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
 
@@ -85,18 +83,54 @@ async def detect_leave(transcript):
     prompt = f"""
 Gebruiker stuurde: "{transcript}"
 Vandaag: {today.strftime("%-d-%-m-%Y")}
-
 Geeft de gebruiker aan dat ze NIET werken (verlof, vrij, ziek)?
 Antwoord ALLEEN met JSON, geen uitleg, geen backticks:
 - Verlof vandaag: {{"is_leave": true, "until": "{today.strftime("%-d-%-m-%Y")}"}}
 - Verlof periode: {{"is_leave": true, "until": "D-M-YYYY"}}
 - Geen verlof: {{"is_leave": false, "until": null}}
 """
-    response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw).strip()
+    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0)
+    raw = re.sub(r"^```(?:json)?", "", r.choices[0].message.content.strip()).strip()
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
+
+async def send_weekly_analysis(bot, chat_id):
+    try:
+        r = httpx.get(WEBHOOK_URL, params={"type": "stats", "secret": REMINDER_SECRET}, follow_redirects=True, timeout=30)
+        stats = r.json()
+        total_hours = stats["totalHours"]
+        total_euro = stats["totalEuro"]
+        week_nr = stats["weekNr"]
+        per_klant = stats["perKlant"]
+
+        doel_uren = 80
+        doel_euro = 8000
+        resterend = max(0, doel_uren - total_hours)
+        weken_over = max(1, 4 - week_nr)
+        nodig_pw = round(resterend / weken_over, 1)
+
+        klant_tekst = ""
+        for klant, minuten in sorted(per_klant.items(), key=lambda x: x[1], reverse=True):
+            klant_tekst += f"  • {klant}: {round(minuten/60, 1)}u\n"
+
+        if total_hours > doel_uren:
+            motivatie = f"🌟 *Wauw, {total_hours}u — meer dan je doel van {doel_uren}u!*\nBen je zeker dat je alles geregistreerd hebt? Wil je nog iets toevoegen, of neem je de extra uren mee?"
+        elif total_hours >= doel_uren * 0.75:
+            motivatie = f"💪 *Goed bezig! {total_hours}u van {doel_uren}u.*\nNog {resterend}u in {weken_over} week(en) = ~{nodig_pw}u/week. Dat lukt! 🚀"
+        elif total_hours >= doel_uren * 0.5:
+            motivatie = f"📈 *Halverwege! {total_hours}u van {doel_uren}u.*\nNog {resterend}u in {weken_over} week(en) = ~{nodig_pw}u/week. Zet er een tandje bij! 💼"
+        else:
+            motivatie = f"⚡ *{total_hours}u — tijd om bij te steken!*\nNog {resterend}u in {weken_over} week(en) = ~{nodig_pw}u/week. Je kan het! 💪"
+
+        msg = f"📊 *Weekupdate — week {week_nr} van de maand*\n\n⏱ *Uren:* {total_hours}u / {doel_uren}u\n"
+        if week_nr >= 2:
+            msg += f"💶 *Te factureren:* €{total_euro} / €{doel_euro}\n"
+        msg += f"\n*Per klant:*\n{klant_tekst}\n{motivatie}"
+
+        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Weekrapport fout: {e}", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=f"❌ Weekrapport fout: {str(e)}")
 
 async def process_message(update, transcript):
     leave_info = await detect_leave(transcript)
@@ -115,8 +149,7 @@ async def process_message(update, transcript):
     entries = await parse_timeentry(transcript)
     confirm_text = "✅ Dit ga ik invullen:\n\n"
     for e in entries:
-        uren = e['minuten'] / 60
-        confirm_text += f"• *{e['klant']}* ({e['datum']}) — {e['beschrijving']} ({e['minuten']} min / {uren:.1f}u)\n"
+        confirm_text += f"• *{e['klant']}* ({e['datum']}) — {e['beschrijving']} ({e['minuten']} min / {round(e['minuten']/60,1)}u)\n"
     await update.message.reply_text(confirm_text, parse_mode="Markdown")
     write_to_sheet(entries, transcript)
     state["responded_today"] = True
@@ -155,10 +188,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Oeps: {str(e)}")
 
-# --- HTTP server voor cron-job.org triggers ---
 class ReminderHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        import asyncio
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -172,7 +203,9 @@ class ReminderHandler(BaseHTTPRequestHandler):
             return
 
         app = state.get("app")
-        if not app:
+        loop = state.get("loop")
+
+        if not app or not loop:
             self.send_response(503)
             self.end_headers()
             self.wfile.write(b"Bot not ready")
@@ -182,34 +215,23 @@ class ReminderHandler(BaseHTTPRequestHandler):
             if trigger == "reminder17":
                 reset_daily_state()
                 if not is_on_leave():
-                    await app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊",
-                        parse_mode="Markdown"
-                    )
+                    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="👋 Hé Lenja! Werkdag bijna gedaan!\n\nStuur me een 🎤 *voice bericht*:\n• Voor welke klanten werkte je?\n• Wat deed je?\n• Hoeveel uur?\n\nMeerdere klanten mag in één bericht! 📊", parse_mode="Markdown")
             elif trigger == "reminder1730":
                 if not state["responded_today"] and not is_on_leave():
-                    await app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊",
-                        parse_mode="Markdown"
-                    )
+                    await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⏰ Nog even! Geen tijdsregistratie ontvangen.\n\nWas je vrij? Stuur *'vandaag verlof'*. 😊", parse_mode="Markdown")
             elif trigger == "reminder09":
                 if not is_on_leave():
                     yesterday = date.today() - timedelta(days=1)
                     if yesterday.weekday() < 5 and not state["responded_today"]:
-                        await app.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤"
-                        )
+                        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌅 Goedemorgen! Gisteren ({yesterday.strftime('%-d/%-m')}) nog geen tijdsregistratie.\n\nWil je dat alsnog doen? Zeg erbij 'gisteren'! 🎤")
             elif trigger == "weekrapport":
-                await send_weekly_analysis(app, TELEGRAM_CHAT_ID)
+                await send_weekly_analysis(app.bot, TELEGRAM_CHAT_ID)
 
-        future = asyncio.run_coroutine_threadsafe(send_reminder(), app._loop)
+        future = asyncio.run_coroutine_threadsafe(send_reminder(), loop)
         try:
             future.result(timeout=30)
         except Exception as ex:
-            logger.error(f"Reminder fout: {ex}")
+            logger.error(f"Reminder fout: {ex}", exc_info=True)
 
         self.send_response(200)
         self.end_headers()
@@ -231,90 +253,16 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    # Start HTTP server in aparte thread
     t = threading.Thread(target=start_http_server, daemon=True)
     t.start()
 
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app._loop = loop
+    async def post_init(application):
+        state["loop"] = asyncio.get_event_loop()
+
+    app.post_init = post_init
 
     logger.info("🤖 Bot gestart!")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
-# --- Vrijdag analyse ---
-async def send_weekly_analysis(app, chat_id):
-    try:
-        # Haal data op uit sheet via Apps Script
-        r = httpx.get(
-            WEBHOOK_URL.replace("/exec", "/exec"),
-            params={"type": "stats", "secret": REMINDER_SECRET},
-            follow_redirects=True,
-            timeout=30
-        )
-        stats = r.json()
-        
-        total_hours = stats["totalHours"]
-        total_euro = stats["totalEuro"]
-        week_nr = stats["weekNr"]
-        per_klant = stats["perKlant"]
-        
-        doel_uren = 80
-        doel_euro = 8000
-        resterend_uren = max(0, doel_uren - total_hours)
-        weken_over = 4 - week_nr
-        uren_per_week_nodig = round(resterend_uren / max(weken_over, 1), 1) if weken_over > 0 else 0
-        
-        # Per klant overzicht
-        klant_tekst = ""
-        for klant, minuten in sorted(per_klant.items(), key=lambda x: x[1], reverse=True):
-            uren = round(minuten / 60, 1)
-            klant_tekst += f"  • {klant}: {uren}u\n"
-        
-        # Motivatie bericht
-        if total_hours > doel_uren:
-            motivatie = (
-                f"🌟 *Wauw, je hebt al {total_hours}u geregistreerd — dat is meer dan je doel van {doel_uren}u!*\n\n"
-                f"Ben je zeker dat je alles geregistreerd hebt? 🤔\n"
-                f"Wil je nog iets toevoegen, of neem je de extra uren mee naar volgende maand?"
-            )
-        elif total_hours >= doel_uren * 0.75:
-            motivatie = (
-                f"💪 *Goed bezig! Je zit op {total_hours}u van je {doel_uren}u doel.*\n\n"
-                f"Nog {resterend_uren}u te gaan. Als je nog {weken_over} week(en) hebt, "
-                f"moet je ~{uren_per_week_nodig}u/week halen. Dat lukt! 🚀"
-            )
-        elif total_hours >= doel_uren * 0.5:
-            motivatie = (
-                f"📈 *Halverwege! Je staat op {total_hours}u van je {doel_uren}u doel.*\n\n"
-                f"Nog {resterend_uren}u nodig in {weken_over} week(en) = ~{uren_per_week_nodig}u/week. "
-                f"Zet er een tandje bij! 💼"
-            )
-        else:
-            motivatie = (
-                f"⚡ *{total_hours}u geregistreerd — tijd om bij te steken!*\n\n"
-                f"Je doel is {doel_uren}u/maand. Nog {resterend_uren}u te gaan in {weken_over} week(en) "
-                f"= ~{uren_per_week_nodig}u/week. Je kan het! 💪"
-            )
-        
-        # Basis bericht
-        msg = (
-            f"📊 *Weekupdate — week {week_nr} van de maand*\n\n"
-            f"⏱ *Uren deze maand:* {total_hours}u / {doel_uren}u doel\n"
-        )
-        
-        # Vanaf week 2: ook euro's tonen
-        if week_nr >= 2:
-            msg += f"💶 *Te factureren:* €{total_euro} / €{doel_euro} doel\n"
-        
-        msg += f"\n*Per klant:*\n{klant_tekst}\n{motivatie}"
-        
-        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.error(f"Weekrapport fout: {e}", exc_info=True)
-        await app.bot.send_message(chat_id=chat_id, text=f"❌ Kon weekrapport niet ophalen: {str(e)}")
