@@ -8,8 +8,6 @@ import json
 import re
 import tempfile
 import httpx
-from google.oauth2.service_account import Credentials
-from google.auth.transport.requests import Request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,12 +15,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_PROJECT_ID = os.environ["GOOGLE_PROJECT_ID"]
-GOOGLE_PRIVATE_KEY_ID = os.environ["GOOGLE_PRIVATE_KEY_ID"]
-GOOGLE_PRIVATE_KEY = os.environ["GOOGLE_PRIVATE_KEY"].replace('\\n', '\n')
-GOOGLE_CLIENT_EMAIL = os.environ["GOOGLE_CLIENT_EMAIL"]
-GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
@@ -39,39 +32,22 @@ def is_on_leave():
 def reset_daily_state():
     state["responded_today"] = False
 
-def get_credentials():
-    creds_dict = {
-        "type": "service_account",
-        "project_id": GOOGLE_PROJECT_ID,
-        "private_key_id": GOOGLE_PRIVATE_KEY_ID,
-        "private_key": GOOGLE_PRIVATE_KEY,
-        "client_email": GOOGLE_CLIENT_EMAIL,
-        "client_id": GOOGLE_CLIENT_ID,
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-    }
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    creds.refresh(Request())
-    return creds.token
-
-def write_to_sheet(entries, date_str, transcript):
-    token = get_credentials()
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/A1:append"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+def write_to_sheet(entries, transcript):
+    rows = []
     for entry in entries:
-        row = [date_str, entry.get("klant", ""), entry.get("minuten", 0), entry.get("beschrijving", ""), transcript]
-        params = {"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"}
-        body = {"values": [row]}
-        logger.info(f"Writing to sheet: {row[:3]}")
-        r = httpx.post(url, headers=headers, params=params, json=body)
-        logger.info(f"Sheet response: {r.status_code} {r.text[:200]}")
-        r.raise_for_status()
+        rows.append({
+            "datum": entry.get("datum", date.today().strftime("%-d-%-m-%Y")),
+            "klant": entry.get("klant", ""),
+            "minuten": entry.get("minuten", 0),
+            "beschrijving": entry.get("beschrijving", ""),
+            "transcript": transcript
+        })
+    payload = {"rows": rows}
+    logger.info(f"Sending to webhook: {rows}")
+    r = httpx.post(WEBHOOK_URL, json=payload, follow_redirects=True, timeout=30)
+    logger.info(f"Webhook response: {r.status_code} {r.text[:200]}")
+    if r.status_code != 200 or r.text.strip() != "OK":
+        raise Exception(f"Webhook fout: {r.status_code} {r.text[:100]}")
 
 async def transcribe_voice(file_path):
     with open(file_path, "rb") as f:
@@ -142,7 +118,7 @@ async def process_message(update, transcript):
         confirm_text += f"• *{e['klant']}* ({e['datum']}) — {e['beschrijving']} ({e['minuten']} min / {uren:.1f}u)\n"
     await update.message.reply_text(confirm_text, parse_mode="Markdown")
 
-    write_to_sheet(entries, entries[0]['datum'] if entries else date.today().strftime("%-d-%-m-%Y"), transcript)
+    write_to_sheet(entries, transcript)
     state["responded_today"] = True
     await update.message.reply_text("🎉 Staat in je sheet!")
 
